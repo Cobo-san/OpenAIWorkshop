@@ -28,7 +28,7 @@ env_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "mcp", ".en
 load_dotenv(env_path)
 
 from agent_framework import Agent, MCPStreamableHTTPTool
-from agent_framework.azure import AzureOpenAIChatClient
+from agent_framework.openai import OpenAIChatClient
 
 
 async def main() -> None:
@@ -61,10 +61,10 @@ async def main() -> None:
         print(f"✅ Connected! Tools available: {tool_names}")
 
         # ── Create the local coordinator agent ──────────────────────────
-        client = AzureOpenAIChatClient(
+        client = OpenAIChatClient(
             api_key=api_key,
-            endpoint=endpoint,
-            deployment_name=deployment,
+            azure_endpoint=endpoint,
+            model=deployment,
             api_version=api_version,
         )
 

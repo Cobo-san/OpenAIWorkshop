@@ -1,13 +1,14 @@
 """
-Regression tests for agent-framework 1.0.0rc1 upgrade.
+Regression tests for agent-framework 1.2.1 upgrade.
 
 Tests all agent types (single, handoff, reflection, magentic) to verify:
-1. Import compatibility with the new RC1 API
+1. Import compatibility with the 1.2.1 API
 2. Constructor signatures work correctly
-3. Session management (AgentThread → AgentSession migration)
-4. Streaming API (run_stream → run(stream=True))
+3. Session management (AgentSession)
+4. Streaming API (run(stream=True))
 5. Event processing (unified WorkflowEvent model)
-6. MagenticBuilder new constructor-based API
+6. MagenticBuilder constructor-based API
+7. Native HandoffBuilder integration in the handoff agent
 """
 
 import asyncio
@@ -30,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'agentic_ai'))
 
 
 class TestImportCompatibility:
-    """Verify all imports resolve correctly against agent-framework 1.0.0rc1."""
+    """Verify all imports resolve correctly against agent-framework 1.2.1."""
 
     def test_core_framework_imports(self):
         """Core agent_framework symbols used across all agents."""
@@ -52,10 +53,18 @@ class TestImportCompatibility:
         assert AgentSession is not None
         assert ChatOptions is not None
 
-    def test_azure_client_import(self):
-        """AzureOpenAIChatClient import."""
-        from agent_framework.azure import AzureOpenAIChatClient
-        assert AzureOpenAIChatClient is not None
+    def test_openai_client_import(self):
+        """OpenAIChatClient is the unified chat client (replaces AzureOpenAIChatClient)."""
+        from agent_framework.openai import OpenAIChatClient
+        assert OpenAIChatClient is not None
+
+    def test_legacy_azure_client_removed(self):
+        """The 1.0.0rc1 AzureOpenAIChatClient is no longer exported by agent_framework.azure."""
+        import agent_framework.azure as az
+        assert not hasattr(az, "AzureOpenAIChatClient"), (
+            "AzureOpenAIChatClient was removed in 1.2.x; use "
+            "agent_framework.openai.OpenAIChatClient with azure_endpoint=... instead."
+        )
 
     def test_orchestration_imports(self):
         """Orchestration symbols moved to agent_framework_orchestrations."""
@@ -67,6 +76,20 @@ class TestImportCompatibility:
             MagenticPlanReviewResponse,
         )
         assert MagenticBuilder is not None
+
+    def test_native_handoff_imports(self):
+        """Native handoff orchestration is available in 1.2.x."""
+        from agent_framework_orchestrations import (
+            HandoffBuilder,
+            HandoffAgentUserRequest,
+            HandoffSentEvent,
+            HandoffConfiguration,
+        )
+        assert HandoffBuilder is not None
+        assert HandoffSentEvent is not None
+        assert HandoffConfiguration is not None
+        # HandoffAgentUserRequest provides helpers used by chat_async resumption
+        assert hasattr(HandoffAgentUserRequest, "create_response")
 
     def test_single_agent_import(self):
         """Single agent module loads cleanly."""
@@ -108,7 +131,7 @@ class TestImportCompatibility:
 
 
 class TestAgentConstructors:
-    """Verify agent constructors use the new RC1 signatures."""
+    """Verify agent constructors use the 1.2.1 signatures."""
 
     def test_framework_agent_constructor_signature(self):
         """Agent(client, instructions, *, name, tools, default_options)."""
@@ -121,6 +144,10 @@ class TestAgentConstructors:
         assert 'name' in params
         assert 'tools' in params
         assert 'default_options' in params
+        # 1.2.x adds first-class support for handoff workflows via this flag
+        assert 'require_per_service_call_history_persistence' in params
+        # description was wired through in 1.2.x and is consumed by HandoffBuilder
+        assert 'description' in params
 
     def test_chat_options_model_id(self):
         """ChatOptions accepts model_id for specifying the model."""
@@ -128,17 +155,32 @@ class TestAgentConstructors:
         opts = ChatOptions(model_id="gpt-4o")
         assert opts["model_id"] == "gpt-4o"
 
-    def test_azure_client_constructor(self):
-        """AzureOpenAIChatClient accepts deployment_name, endpoint, api_version."""
-        from agent_framework.azure import AzureOpenAIChatClient
+    def test_openai_client_constructor_supports_azure_kwargs(self):
+        """OpenAIChatClient accepts model, api_key, credential, azure_endpoint, api_version."""
+        from agent_framework.openai import OpenAIChatClient
         import inspect
-        sig = inspect.signature(AzureOpenAIChatClient.__init__)
-        params = list(sig.parameters.keys())
+        sig = inspect.signature(OpenAIChatClient.__init__)
+        params = set(sig.parameters.keys()) - {'self'}
+        # Unified client uses `model` (not `deployment_name`) and `azure_endpoint` (not `endpoint`)
+        assert 'model' in params
         assert 'api_key' in params
-        assert 'deployment_name' in params
-        assert 'endpoint' in params
-        assert 'api_version' in params
         assert 'credential' in params
+        assert 'azure_endpoint' in params
+        assert 'api_version' in params
+        # The legacy 1.0.0rc1 names should not be present anymore
+        assert 'deployment_name' not in params, "deployment_name was renamed to model in 1.2.x"
+
+    def test_openai_client_routes_to_azure(self):
+        """Passing azure_endpoint routes the OpenAIChatClient to the Azure backend."""
+        from agent_framework.openai import OpenAIChatClient
+        client = OpenAIChatClient(
+            model="gpt-4o",
+            api_key="dummy-key",
+            azure_endpoint="https://example.openai.azure.com/",
+            api_version="2024-08-01-preview",
+        )
+        assert client.azure_endpoint == "https://example.openai.azure.com/"
+        assert client.api_version == "2024-08-01-preview"
 
 
 # =============================================================================
@@ -415,16 +457,22 @@ class TestSingleAgentIntegration:
 
 
 class TestHandoffAgentIntegration:
-    """Test handoff agent construction and domain configuration."""
+    """Test handoff agent construction and native HandoffBuilder integration.
+
+    The handoff agent was rewritten in 1.2.x to use the native
+    ``HandoffBuilder`` orchestration (no more hand-rolled intent classifier
+    or regex-based handoff detection).
+    """
 
     def test_handoff_agent_init(self):
-        """Handoff agent initializes with domain tracking."""
+        """Handoff agent initializes with empty domain agent map and no current domain."""
         from agents.agent_framework.multi_agent.handoff_multi_domain_agent import Agent
         store = {}
         agent = Agent(state_store=store, session_id="handoff-test")
         assert agent._current_domain is None
         assert agent._domain_agents == {}
-        assert agent._domain_sessions == {}
+        assert agent._workflow is None
+        assert agent._initialized is False
 
     def test_handoff_agent_restores_domain(self):
         """Handoff agent restores current domain from state_store."""
@@ -433,16 +481,41 @@ class TestHandoffAgentIntegration:
         agent = Agent(state_store=store, session_id="handoff-test")
         assert agent._current_domain == "crm_billing"
 
-    def test_handoff_detects_handoff_phrases(self):
-        """Handoff detection logic works."""
+    def test_handoff_uses_native_handoff_builder(self):
+        """The handoff agent module imports HandoffBuilder from agent_framework_orchestrations."""
+        from agents.agent_framework.multi_agent import handoff_multi_domain_agent as mod
+        from agent_framework_orchestrations import HandoffBuilder, HandoffAgentUserRequest
+        # The rewritten module should reference the native HandoffBuilder API
+        assert mod.HandoffBuilder is HandoffBuilder
+        assert mod.HandoffAgentUserRequest is HandoffAgentUserRequest
+
+    def test_handoff_no_legacy_classifier_attributes(self):
+        """The 1.0.0rc1 hand-rolled classifier helpers were removed in 1.2.x."""
         from agents.agent_framework.multi_agent.handoff_multi_domain_agent import Agent
-        agent = Agent(state_store={}, session_id="test")
-        assert agent._detect_handoff_request(
-            "This is outside my area. Let me connect you with the right specialist."
+        agent = Agent(state_store={}, session_id="handoff-test")
+        # These were the old hand-rolled helpers; native HandoffBuilder replaces them
+        assert not hasattr(agent, "_detect_handoff_request"), (
+            "Regex-based handoff detection was removed; HandoffBuilder injects "
+            "synthetic handoff tools that are intercepted via middleware."
         )
-        assert not agent._detect_handoff_request(
-            "Your billing summary shows $50.00 due."
+        assert not hasattr(agent, "_classify_intent"), (
+            "Hand-rolled intent classifier was removed; agents now decide "
+            "handoffs themselves by calling the auto-generated handoff tools."
         )
+        assert not hasattr(agent, "_domain_sessions"), (
+            "Per-domain AgentSessions were removed; the workflow's checkpoint "
+            "storage manages conversation state across handoffs."
+        )
+
+    def test_handoff_domains_have_descriptions(self):
+        """Each domain config must have a description (used by HandoffBuilder for tool docs)."""
+        from agents.agent_framework.multi_agent.handoff_multi_domain_agent import DOMAINS
+        assert set(DOMAINS) == {"crm_billing", "product_promotions", "security_authentication"}
+        for domain_id, cfg in DOMAINS.items():
+            assert cfg.get("description"), (
+                f"Domain '{domain_id}' must have a description; HandoffBuilder uses "
+                f"it to generate the auto-injected handoff tool description."
+            )
 
 
 class TestReflectionAgentIntegration:
@@ -464,6 +537,28 @@ class TestReflectionAgentIntegration:
         assert agent._is_approved("APPROVE - looks good")
         assert not agent._is_approved("Needs improvement on point 3")
 
+    def test_reflection_agent_uses_1_2_1_chat_client_kwargs(self):
+        """The reflection agent must use 1.2.x kwarg names (model, azure_endpoint).
+
+        The chat client is constructed via ``OpenAIChatClient(**client_kwargs)``,
+        so the kwarg dict keys must match the new API names — this is a
+        common foot-gun when migrating from 1.0.0rc1.
+        """
+        import inspect
+        from agents.agent_framework.multi_agent import reflection_agent as mod
+        src = inspect.getsource(getattr(mod.Agent, "_setup_agents"))
+        # Old-API key strings should not appear in the setup code path
+        assert '"deployment_name"' not in src, (
+            "reflection_agent passes 'deployment_name' to OpenAIChatClient; "
+            "rename to 'model' for the 1.2.x API."
+        )
+        # Note: a literal `'endpoint':` could also match the unrelated HTTP endpoint
+        # field, so we look for the specific Azure key-rename pattern instead.
+        assert '"endpoint": self.azure_openai_endpoint' not in src, (
+            "reflection_agent passes 'endpoint' to OpenAIChatClient; "
+            "rename to 'azure_endpoint' for the 1.2.x API."
+        )
+
 
 class TestMagenticGroupIntegration:
     """Test magentic group agent construction."""
@@ -483,6 +578,94 @@ class TestMagenticGroupIntegration:
         backing = {}
         storage = DictCheckpointStorage(backing)
         assert storage.latest_checkpoint_id is None
+
+    def test_magentic_checkpoint_storage_implements_1_2_1_protocol(self):
+        """DictCheckpointStorage implements the 1.2.x CheckpointStorage protocol.
+
+        In 1.0.0rc1 the methods were named save_checkpoint/load_checkpoint/...; in
+        1.2.x they are save/load/delete/get_latest with workflow_name kwargs.
+        """
+        from agents.agent_framework.multi_agent.magentic_group import DictCheckpointStorage
+        import inspect
+        for name in ("save", "load", "delete", "get_latest", "list_checkpoints", "list_checkpoint_ids"):
+            assert callable(getattr(DictCheckpointStorage, name, None)), (
+                f"DictCheckpointStorage must implement 1.2.x method {name!r}"
+            )
+        # Old method names should NOT exist
+        assert not hasattr(DictCheckpointStorage, "save_checkpoint"), \
+            "save_checkpoint was renamed to save in 1.2.x"
+        assert not hasattr(DictCheckpointStorage, "load_checkpoint"), \
+            "load_checkpoint was renamed to load in 1.2.x"
+        # workflow_name keyword-only enforcement
+        for name in ("list_checkpoints", "list_checkpoint_ids", "get_latest"):
+            sig = inspect.signature(getattr(DictCheckpointStorage, name))
+            assert "workflow_name" in sig.parameters, (
+                f"{name} must accept workflow_name keyword in 1.2.x"
+            )
+
+    def test_handoff_checkpoint_storage_implements_1_2_1_protocol(self):
+        """The handoff agent's _DictCheckpointStorage matches the 1.2.x protocol."""
+        from agents.agent_framework.multi_agent.handoff_multi_domain_agent import _DictCheckpointStorage
+        for name in ("save", "load", "delete", "get_latest", "list_checkpoints", "list_checkpoint_ids"):
+            assert callable(getattr(_DictCheckpointStorage, name, None)), (
+                f"_DictCheckpointStorage must implement 1.2.x method {name!r}"
+            )
+
+    def test_workflow_checkpoint_uses_workflow_name(self):
+        """WorkflowCheckpoint uses workflow_name (was workflow_id in 1.0.0rc1)."""
+        from agent_framework import WorkflowCheckpoint
+        import inspect
+        sig = inspect.signature(WorkflowCheckpoint.__init__)
+        assert "workflow_name" in sig.parameters
+        assert "workflow_id" not in sig.parameters, \
+            "workflow_id was renamed to workflow_name in 1.2.x"
+
+    def test_dict_checkpoint_storage_save_load_roundtrip(self):
+        """save() persists a checkpoint that load()/get_latest() can recover."""
+        from agents.agent_framework.multi_agent.magentic_group import DictCheckpointStorage
+        from agent_framework import WorkflowCheckpoint
+
+        storage = DictCheckpointStorage({})
+        cp = WorkflowCheckpoint(workflow_name="wf-A", graph_signature_hash="hash-1", checkpoint_id="cp-1")
+
+        cid = asyncio.get_event_loop().run_until_complete(storage.save(cp))
+        assert cid == "cp-1"
+
+        loaded = asyncio.get_event_loop().run_until_complete(storage.load("cp-1"))
+        assert loaded is not None
+        assert loaded.workflow_name == "wf-A"
+        assert loaded.checkpoint_id == "cp-1"
+
+        latest = asyncio.get_event_loop().run_until_complete(storage.get_latest(workflow_name="wf-A"))
+        assert latest is not None and latest.checkpoint_id == "cp-1"
+
+        # get_latest with a non-matching workflow_name returns None
+        none = asyncio.get_event_loop().run_until_complete(storage.get_latest(workflow_name="other"))
+        assert none is None
+
+    def test_get_latest_checkpoint_id_uses_workflow_name_kwarg(self):
+        """_get_latest_checkpoint_id resumes from a 1.2.x-protocol-only storage.
+
+        Storages that follow the 1.2.x ``CheckpointStorage`` protocol require
+        the keyword-only ``workflow_name`` argument on ``get_latest`` /
+        ``list_checkpoints`` / ``list_checkpoint_ids`` and do not expose the
+        nonstandard ``latest_checkpoint_id`` convenience. The resume helper
+        must call those methods with ``workflow_name=`` so it can still find
+        the latest checkpoint.
+        """
+        from agents.agent_framework.multi_agent.magentic_group import Agent, DictCheckpointStorage
+        from agent_framework import WorkflowCheckpoint
+
+        # Back the storage with a dict that records the workflow_name so
+        # _workflow_name_for_storage can recover it (mirrors how save() works).
+        backing: dict = {"workflow_name": "wf-resume"}
+        storage = DictCheckpointStorage(backing)
+        cp = WorkflowCheckpoint(workflow_name="wf-resume", graph_signature_hash="h", checkpoint_id="cp-latest")
+        asyncio.get_event_loop().run_until_complete(storage.save(cp))
+
+        agent = Agent(state_store={}, session_id="test")
+        latest_id = asyncio.get_event_loop().run_until_complete(agent._get_latest_checkpoint_id(storage))
+        assert latest_id == "cp-latest"
 
     def test_magentic_sanitize_final_answer(self):
         """FINAL_ANSWER prefix is stripped from workflow output."""
@@ -555,17 +738,17 @@ class TestMagenticGroupIntegration:
 
 
 class TestFrameworkVersion:
-    """Verify we're running against the expected RC1 version."""
+    """Verify we're running against the expected 1.2.x version."""
 
     def test_agent_framework_version(self):
-        """agent_framework is at 1.0.0rc1."""
+        """agent_framework is at 1.2.1."""
         import agent_framework
-        assert agent_framework.__version__ == "1.0.0rc1", \
-            f"Expected 1.0.0rc1, got {agent_framework.__version__}"
+        assert agent_framework.__version__ == "1.2.1", \
+            f"Expected 1.2.1, got {agent_framework.__version__}"
 
     def test_agent_framework_core_installed(self):
-        """agent-framework-core is installed as a dependency."""
+        """agent-framework-core is installed at 1.2.1 as a dependency."""
         import importlib.metadata
         version = importlib.metadata.version('agent-framework-core')
-        assert version == "1.0.0rc1", \
-            f"Expected 1.0.0rc1, got {version}"
+        assert version == "1.2.1", \
+            f"Expected 1.2.1, got {version}"

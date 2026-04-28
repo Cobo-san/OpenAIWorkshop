@@ -54,7 +54,7 @@ from agent_framework import (
     MCPStreamableHTTPTool,
     Message,
 )
-from agent_framework.azure import AzureOpenAIChatClient
+from agent_framework.openai import OpenAIChatClient
 from agent_framework.orchestrations import GroupChatBuilder
 
 
@@ -289,10 +289,10 @@ async def main() -> None:
         print(f"   Session: stateful (server maintains conversation history)")
         print()
 
-        client = AzureOpenAIChatClient(
+        client = OpenAIChatClient(
             api_key=api_key,
-            endpoint=endpoint,
-            deployment_name=deployment,
+            azure_endpoint=endpoint,
+            model=deployment,
             api_version=api_version,
         )
 

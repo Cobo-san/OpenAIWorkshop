@@ -66,8 +66,8 @@ if not success:
 async def run_agent_with_tracing():
     """Run a sample agent with full observability."""
     
-    from agent_framework import ChatAgent, MCPStreamableHTTPTool
-    from agent_framework.azure import AzureOpenAIChatClient
+    from agent_framework import Agent, MCPStreamableHTTPTool
+    from agent_framework.openai import OpenAIChatClient
     from azure.identity import DefaultAzureCredential
     
     # Get tracer for custom spans
@@ -106,16 +106,16 @@ async def run_agent_with_tracing():
             timeout=30,
         )
         
-        # Create chat client
-        chat_client = AzureOpenAIChatClient(
-            endpoint=azure_endpoint,
-            deployment_name=deployment_name,
+        # Create chat client (passing azure_endpoint routes to Azure OpenAI)
+        chat_client = OpenAIChatClient(
+            azure_endpoint=azure_endpoint,
+            model=deployment_name,
             credential=DefaultAzureCredential(),
         )
         
         # Create agent
-        agent = ChatAgent(
-            chat_client=chat_client,
+        agent = Agent(
+            client=chat_client,
             tools=[mcp_tool],
             name="CustomerServiceAgent",
             instructions="""You are a helpful customer service agent for Contoso Wireless.
@@ -130,7 +130,7 @@ async def run_agent_with_tracing():
             "Show me the data usage for subscription 1 from 2025-01-01 to 2025-01-15",
         ]
         
-        thread = agent.get_new_thread()
+        session = agent.create_session()
         
         for query in queries:
             print(f"\n👤 User: {query}")
@@ -143,7 +143,7 @@ async def run_agent_with_tracing():
             ) as query_span:
                 query_span.set_attribute("user.query", query)
                 
-                async for update in agent.run_stream(query, thread=thread):
+                async for update in agent.run(query, session=session, stream=True):
                     if update.text:
                         print(update.text, end="")
         print("\n" + "=" * 60)

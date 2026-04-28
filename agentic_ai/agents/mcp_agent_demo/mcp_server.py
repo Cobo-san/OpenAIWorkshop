@@ -25,7 +25,7 @@ env_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "mcp", ".en
 load_dotenv(env_path)
 
 from agent_framework import Agent, tool
-from agent_framework.azure import AzureOpenAIChatClient
+from agent_framework.openai import OpenAIChatClient
 from mcp.server.fastmcp import FastMCP
 
 # ── Domain tools the agent can use ──────────────────────────────────────────
@@ -89,10 +89,10 @@ def main() -> None:
     print(f"🔧 Deployment            : {deployment}")
 
     # 1) Create the agent-framework Agent
-    client = AzureOpenAIChatClient(
+    client = OpenAIChatClient(
         api_key=api_key,
-        endpoint=endpoint,
-        deployment_name=deployment,
+        azure_endpoint=endpoint,
+        model=deployment,
         api_version=api_version,
     )
 
